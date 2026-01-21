@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sistema de votación en tiempo real con WebSockets
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 10
+    MemorySize: 128
+    Environment:
+      Variables:
+        VOTES_TABLE: !Ref VotosTable
+        CONNECTIONS_TABLE: !Ref ConnectionsTable
+
+Resources:
+  # --- TABLAS DYNAMODB ---
+  VotosTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: opcionId
+        Type: String
+
+  ConnectionsTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: connectionId
+        Type: String
+
+  # --- WEBSOCKET API ---
+  VotacionWebSocket:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: VotacionLiveAPI
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  # --- FUNCIONES LAMBDA ---
+  ConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: connect.lambda_handler
+      Events:
+        ConnectEvent:
+          Type: Api
+          Properties:
+            Path: /$connect
+            Method: POST
+            RestApiId: !Ref VotacionWebSocket # Nota: SAM ajusta esto para WebSockets automáticamente
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref ConnectionsTable}
+
+  DisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: disconnect.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref ConnectionsTable}
+
+  VotarFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: votar.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref VotosTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ConnectionsTable}
+        # Permiso para enviar mensajes de vuelta a los usuarios
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'execute-api:ManageConnections'
+              Resource:
+                - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VotacionWebSocket}/*'
+
+  # --- CONFIGURACIÓN DE RUTAS ---
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref VotacionWebSocket
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Join [ '/', [ 'integrations', !Ref ConnectIntegration ] ]
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref VotacionWebSocket
+      RouteKey: $disconnect
+      Target: !Join [ '/', [ 'integrations', !Ref DisconnectIntegration ] ]
+
+  VotarRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref VotacionWebSocket
+      RouteKey: votar
+      Target: !Join [ '/', [ 'integrations', !Ref VotarIntegration ] ]
+
+  # --- INTEGRACIONES ---
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref VotacionWebSocket
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectFunction.Arn}/invocations'
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref VotacionWebSocket
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectFunction.Arn}/invocations'
+
+  VotarIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref VotacionWebSocket
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VotarFunction.Arn}/invocations'
+
+  # --- DESPLIEGUE (STAGE) ---
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - VotarRoute
+    Properties:
+      ApiId: !Ref VotacionWebSocket
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: Prod
+      Description: Prod Stage
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref VotacionWebSocket
+
+Outputs:
+  WebSocketURL:
+    Description: "URL del WebSocket para el Frontend"
+    Value: !Sub "wss://${VotacionWebSocket}.execute-api.${AWS::Region}.amazonaws.com/Prod"
